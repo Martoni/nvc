@@ -48,6 +48,9 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #endif
 
 #ifdef HAVE_SYS_PRCTL_H
@@ -1297,7 +1300,7 @@ void file_read_lock(int fd)
 #ifdef __MINGW32__
    // TODO
 #else
-   if (flock(lib->lock_fd, LOCK_SH) < 0)
+   if (flock(fd, LOCK_SH) < 0)
       fatal_errno("flock");
 #endif
 }
@@ -1307,7 +1310,7 @@ void file_write_lock(int fd)
 #ifdef __MINGW32__
    // TODO
 #else
-   if (flock(lib->lock_fd, LOCK_EX) < 0)
+   if (flock(fd, LOCK_EX) < 0)
       fatal_errno("flock");
 #endif
 }
@@ -1317,7 +1320,7 @@ void file_unlock(int fd)
 #ifdef __MINGW32__
    // TODO
 #else
-   if (flock(lib->lock_fd, LOCK_UN) < 0)
+   if (flock(fd, LOCK_UN) < 0)
       fatal_errno("flock");
 #endif
 }
@@ -1352,6 +1355,6 @@ void make_dir(const char *path)
    fatal("TODO: Windows make_dir");
 #else
    if (mkdir(path, 0777) != 0 && errno != EEXIST)
-      fatal_errno("mkdir: %s", name);
+      fatal_errno("mkdir: %s", path);
 #endif
 }
