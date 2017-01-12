@@ -36,6 +36,10 @@
 #define RETURNS_NONNULL
 #endif
 
+#ifdef __MINGW32__
+#define realpath(N, R) _fullpath((R), (N), _MAX_PATH)
+#endif
+
 #define ARRAY_LEN(a) (sizeof(a) / sizeof(a[0]))
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
