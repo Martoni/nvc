@@ -1339,7 +1339,14 @@ void nvc_rusage(nvc_rusage_t *ru)
 void file_read_lock(int fd)
 {
 #ifdef __MINGW32__
-   // TODO
+   HANDLE hf;
+   LARGE_INTEGER li;
+   OVERLAPPED ovlp;
+   hf = (HANDLE) _get_osfhandle (fd);
+   li.QuadPart = _filelengthi64 (fd);
+   memset(&ovlp, 0, sizeof ovlp);
+   if (!LockFileEx (hf, 0, 0, li.LowPart, li.HighPart, &ovlp))
+         fatal_errno("LockFileEx");
 #else
    if (flock(fd, LOCK_SH) < 0)
       fatal_errno("flock");
@@ -1349,7 +1356,14 @@ void file_read_lock(int fd)
 void file_write_lock(int fd)
 {
 #ifdef __MINGW32__
-   // TODO
+   HANDLE hf;
+   LARGE_INTEGER li;
+   OVERLAPPED ovlp;
+   hf = (HANDLE) _get_osfhandle (fd);
+   li.QuadPart = _filelengthi64 (fd);
+   memset(&ovlp, 0, sizeof ovlp);
+   if (!LockFileEx (hf, LOCKFILE_EXCLUSIVE_LOCK, 0, li.LowPart, li.HighPart, &ovlp))
+         fatal_errno("LockFileEx");
 #else
    if (flock(fd, LOCK_EX) < 0)
       fatal_errno("flock");
@@ -1359,7 +1373,11 @@ void file_write_lock(int fd)
 void file_unlock(int fd)
 {
 #ifdef __MINGW32__
-   // TODO
+   HANDLE hf;
+   LARGE_INTEGER li;
+   hf = (HANDLE) _get_osfhandle (fd);
+   li.QuadPart = _filelengthi64 (fd);
+   UnlockFile (hf, 0, 0, li.LowPart, li.HighPart);
 #else
    if (flock(fd, LOCK_UN) < 0)
       fatal_errno("flock");
@@ -1383,8 +1401,8 @@ void *map_file(int fd, size_t size)
    void *ptr = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
    if (ptr == MAP_FAILED)
       fatal_errno("mmap");
-   return ptr;
 #endif
+   return ptr;
 }
 
 void unmap_file(void *ptr, size_t size)
