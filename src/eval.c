@@ -39,7 +39,8 @@ typedef enum {
    VALUE_UARRAY,
    VALUE_CARRAY,
    VALUE_RECORD,
-   VALUE_HEAP_PROXY
+   VALUE_HEAP_PROXY,
+   VALUE_IMAGE_MAP
 } value_kind_t;
 
 typedef struct value value_t;
@@ -58,11 +59,12 @@ typedef struct {
 struct value {
    value_kind_t kind;
    union {
-      double    real;
-      int64_t   integer;
-      value_t  *pointer;
-      uarray_t *uarray;
-      value_t  *fields;
+      double       real;
+      int64_t      integer;
+      value_t     *pointer;
+      uarray_t    *uarray;
+      value_t     *fields;
+      image_map_t *image_map;
    };
 };
 
@@ -80,6 +82,7 @@ typedef struct {
    bool         failed;
    void        *heap;
    size_t       halloc;
+   loc_t        last_loc;
 } eval_state_t;
 
 #define EVAL_WARN(t, ...) do {                                          \
@@ -482,7 +485,7 @@ static void eval_op_div(int op, eval_state_t *state)
    switch (lhs->kind) {
    case VALUE_INTEGER:
       if (rhs->integer == 0) {
-         error_at(tree_loc(state->fcall), "division by zero");
+         error_at(&(state->last_loc), "division by zero");
          state->failed = true;
       }
       else {
@@ -664,8 +667,7 @@ static void eval_op_abs(int op, eval_state_t *state)
    }
 }
 
-static void eval_load_vcode(lib_t lib, tree_t unit, tree_rd_ctx_t tree_ctx,
-                            eval_state_t *state)
+static void eval_load_vcode(lib_t lib, tree_t unit, eval_state_t *state)
 {
    ident_t unit_name = tree_ident(unit);
 
@@ -673,13 +675,21 @@ static void eval_load_vcode(lib_t lib, tree_t unit, tree_rd_ctx_t tree_ctx,
       notef("loading vcode for %s", istr(unit_name));
 
    char *name LOCAL = xasprintf("_%s.vcode", istr(unit_name));
+   lib_mtime_t mtime;
+   if (lib_stat(lib, name, &mtime)
+       && mtime < lib_mtime(lib, tree_ident(unit))) {
+      EVAL_WARN(state->fcall, "vcode module for %s is out of date",
+                istr(unit_name));
+      return;
+   }
+
    fbuf_t *f = lib_fbuf_open(lib, name, FBUF_IN);
    if (f == NULL) {
       EVAL_WARN(state->fcall, "cannot load vcode for %s", istr(unit_name));
       return;
    }
 
-   vcode_read(f, tree_ctx);
+   vcode_read(f);
    fbuf_close(f);
 }
 
@@ -702,17 +712,16 @@ static void eval_op_fcall(int op, eval_state_t *state)
 
       lib_t lib;
       if (lib_name != unit_name && (lib = lib_find(lib_name, false)) != NULL) {
-         tree_rd_ctx_t tree_ctx;
-         tree_t unit = lib_get_ctx(lib, unit_name, &tree_ctx);
+         tree_t unit = lib_get(lib, unit_name);
          if (unit != NULL) {
-            eval_load_vcode(lib, unit, tree_ctx, state);
+            eval_load_vcode(lib, unit, state);
 
             if (tree_kind(unit) == T_PACKAGE) {
                ident_t body_name =
                   ident_prefix(unit_name, ident_new("body"), '-');
-               tree_t body = lib_get_ctx(lib, body_name, &tree_ctx);
+               tree_t body = lib_get(lib, body_name);
                if (body != NULL)
-                  eval_load_vcode(lib, body, tree_ctx, state);
+                  eval_load_vcode(lib, body, state);
             }
 
             vcode = vcode_find_unit(func_name);
@@ -796,17 +805,17 @@ static void eval_op_bounds(int op, eval_state_t *state)
             break;
          else if (reg->integer < low || reg->integer > high) {
             if (state->flags & EVAL_BOUNDS) {
-               const loc_t *loc = tree_loc(vcode_get_bookmark(op).tree);
-
                switch ((bounds_kind_t)vcode_get_subkind(op)) {
                case BOUNDS_ARRAY_TO:
-                  error_at(loc, "array index %"PRIi64" outside bounds %"PRIi64
-                           " to %"PRIi64, reg->integer, low, high);
+                  error_at(&(state->last_loc), "array index %"PRIi64" outside "
+                           "bounds %"PRIi64" to %"PRIi64,
+                           reg->integer, low, high);
                   break;
 
                case BOUNDS_ARRAY_DOWNTO:
-                  error_at(loc, "array index %"PRIi64" outside bounds %"PRIi64
-                           " downto %"PRIi64, reg->integer, high, low);
+                  error_at(&(state->last_loc), "array index %"PRIi64" outside "
+                           "bounds %"PRIi64" downto %"PRIi64,
+                           reg->integer, high, low);
                   break;
 
                default:
@@ -1108,8 +1117,7 @@ static void eval_op_report(int op, eval_state_t *state)
    value_t *severity = eval_get_reg(vcode_get_arg(op, 0), state);
 
    if (state->flags & EVAL_REPORT)
-      eval_message(text, length, severity,
-                   tree_loc(vcode_get_bookmark(op).tree), "Report");
+      eval_message(text, length, severity, &(state->last_loc), "Report");
    else
       state->failed = true;  // Cannot fold as would change runtime behaviour
 }
@@ -1123,8 +1131,7 @@ static void eval_op_assert(int op, eval_state_t *state)
 
    if (test->integer == 0) {
       if (state->flags & EVAL_REPORT)
-         eval_message(text, length, severity,
-                      tree_loc(vcode_get_bookmark(op).tree), "Assertion");
+         eval_message(text, length, severity, &(state->last_loc), "Assertion");
       state->failed = severity->integer >= SEVERITY_ERROR;
    }
 }
@@ -1194,45 +1201,58 @@ static void eval_op_index_check(int op, eval_state_t *state)
       state->failed = true;
 }
 
+static void eval_op_image_map(int op, eval_state_t *state)
+{
+   image_map_t *map = eval_alloc(sizeof(image_map_t), state);
+   vcode_get_image_map(op, map);
+
+   value_t *result = eval_get_reg(vcode_get_result(op), state);
+   result->kind = VALUE_IMAGE_MAP;
+   result->image_map = map;
+}
+
 static void eval_op_image(int op, eval_state_t *state)
 {
    value_t *object = eval_get_reg(vcode_get_arg(op, 0), state);
-   tree_t where = vcode_get_bookmark(op).tree;
-   type_t type = type_base_recur(tree_type(where));
+   char *buf LOCAL = NULL;
 
-   char buf[32];
-   size_t len = 0;
+   if (vcode_count_args(op) == 1) {
+      // No image map
+      switch (object->kind) {
+      case VALUE_INTEGER:
+         buf = xasprintf("%"PRIi64, object->integer);
+         break;
 
-   switch (type_kind(type)) {
-   case T_INTEGER:
-      len = snprintf(buf, sizeof(buf), "%"PRIi64, object->integer);
-      break;
+      case VALUE_REAL:
+         buf = xasprintf("%.*g", DBL_DIG + 3, object->real);
+         break;
 
-   case T_ENUM:
-      {
-         tree_t lit = type_enum_literal(type, object->integer);
-         len = snprintf(buf, sizeof(buf), "%s", istr(tree_ident(lit)));
+      default:
+         fatal_trace("bad value type for image operation");
       }
-      break;
+   }
+   else {
+      value_t *map = eval_get_reg(vcode_get_arg(op, 1), state);
+      assert(map->kind = VALUE_IMAGE_MAP);
 
-   case T_REAL:
-      len = snprintf(buf, sizeof(buf), "%.*g", DBL_DIG + 3, object->real);
-      break;
+      switch (map->image_map->kind) {
+      case IMAGE_ENUM:
+         if (object->integer < 0 || object->integer >= map->image_map->nelems)
+            fatal_trace("invalid enum value %"PRIi64, object->integer);
+         buf = xasprintf("%s", istr(map->image_map->elems[object->integer]));
+         break;
 
-   case T_PHYSICAL:
-      {
-         tree_t unit = type_unit(type, 0);
-         len = snprintf(buf, sizeof(buf), "%"PRIi64" %s", object->integer,
-                        istr(tree_ident(unit)));
+      case IMAGE_PHYSICAL:
+         buf = xasprintf("%"PRIi64" %s", object->integer,
+                         istr(map->image_map->elems[0]));
+         break;
+
+      default:
+         fatal_trace("unexpected image map kind %d", map->image_map->kind);
       }
-      break;
-
-   default:
-      error_at(tree_loc(where), "cannot use 'IMAGE with this type");
-      state->failed = true;
-      return;
    }
 
+   size_t len = strlen(buf);
    value_t *dst = eval_get_reg(vcode_get_result(op), state);
    dst->kind = VALUE_UARRAY;
    if ((dst->uarray = eval_alloc(sizeof(uarray_t), state)) == NULL)
@@ -1392,13 +1412,17 @@ static void eval_op_array_size(int op, eval_state_t *state)
 
    if (rlen->integer != llen->integer) {
       if (state->flags & EVAL_BOUNDS) {
-         vcode_bookmark_t where = vcode_get_bookmark(op);
-         error_at(tree_loc(where.tree), "length of target %"PRIi64" does not "
+         error_at(&(state->last_loc), "length of target %"PRIi64" does not "
                   "match length of value %"PRIi64,
                   llen->integer, rlen->integer);
       }
       state->failed = true;
    }
+}
+
+static void eval_op_debug_info(int op, eval_state_t *state)
+{
+   state->last_loc = *vcode_get_loc(op);
 }
 
 static void eval_vcode(eval_state_t *state)
@@ -1616,6 +1640,14 @@ static void eval_vcode(eval_state_t *state)
          eval_op_array_size(i, state);
          break;
 
+      case VCODE_OP_IMAGE_MAP:
+         eval_op_image_map(i, state);
+         break;
+
+      case VCODE_OP_DEBUG_INFO:
+         eval_op_debug_info(i, state);
+         break;
+
       default:
          vcode_dump();
          fatal("cannot evaluate vcode op %s", vcode_op_string(vcode_get_op(i)));
@@ -1701,41 +1733,4 @@ tree_t eval(tree_t fcall, eval_flags_t flags)
 int eval_errors(void)
 {
    return errors;
-}
-
-static tree_t fold_tree_fn(tree_t t, void *context)
-{
-   switch (tree_kind(t)) {
-   case T_FCALL:
-      return eval(t, EVAL_FCALL | EVAL_FOLDING);
-
-   case T_REF:
-      {
-         tree_t decl = tree_ref(t);
-         switch (tree_kind(decl)) {
-         case T_CONST_DECL:
-            {
-               tree_t value = tree_value(decl);
-               if (tree_kind(value) == T_LITERAL)
-                  return value;
-               else
-                  return t;
-            }
-
-         case T_UNIT_DECL:
-            return tree_value(decl);
-
-         default:
-            return t;
-         }
-      }
-
-   default:
-      return t;
-   }
-}
-
-void fold(tree_t top)
-{
-   tree_rewrite(top, fold_tree_fn, NULL);
 }

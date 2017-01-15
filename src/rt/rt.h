@@ -1,5 +1,5 @@
 //
-//  Copyright (C) 2011-2015  Nick Gasson
+//  Copyright (C) 2011-2016  Nick Gasson
 //
 //  This program is free software: you can redistribute it and/or modify
 //  it under the terms of the GNU General Public License as published by
@@ -60,6 +60,13 @@ typedef enum {
 } bit_vec_op_kind_t;
 
 typedef enum {
+   IMAGE_INTEGER,
+   IMAGE_REAL,
+   IMAGE_ENUM,
+   IMAGE_PHYSICAL,
+} image_kind_t;
+
+typedef enum {
    NET_F_ACTIVE     = (1 << 0),
    NET_F_EVENT      = (1 << 1),
    NET_F_FORCED     = (1 << 2),
@@ -90,7 +97,7 @@ typedef enum {
    SEVERITY_FAILURE
 } rt_severity_t;
 
-void rt_start_of_tool(tree_t top, tree_rd_ctx_t ctx);
+void rt_start_of_tool(tree_t top);
 void rt_end_of_tool(tree_t top);
 void rt_run_sim(uint64_t stop_time);
 void rt_run_interactive(uint64_t stop_time);
@@ -116,7 +123,7 @@ void *jit_fun_ptr(const char *name, bool required);
 void *jit_var_ptr(const char *name, bool required);
 void jit_bind_fn(const char *name, void *ptr);
 
-void shell_run(tree_t top, tree_rd_ctx_t ctx);
+void shell_run(tree_t top);
 
 text_buf_t *pprint(struct tree *t, const uint64_t *values, size_t len);
 

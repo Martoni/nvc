@@ -107,8 +107,6 @@ typedef uint64_t imask_t;
 #define OBJECT_TAG_TREE  0
 #define OBJECT_TAG_TYPE  1
 
-#define MAX_FILES 512
-
 DECLARE_ARRAY(netid);
 DECLARE_ARRAY(range);
 DECLARE_ARRAY(tree);
@@ -230,7 +228,6 @@ typedef struct {
    ident_wr_ctx_t  ident_ctx;
    unsigned        generation;
    unsigned        n_objects;
-   const char     *file_names[MAX_FILES];
 } object_wr_ctx_t;
 
 typedef struct {
@@ -240,7 +237,6 @@ typedef struct {
    object_t      **store;
    unsigned        store_sz;
    char           *db_fname;
-   const char     *file_names[MAX_FILES];
 } object_rd_ctx_t;
 
 __attribute__((noreturn))
@@ -266,13 +262,9 @@ void object_replace(object_t *t, object_t *a);
 void object_write(object_t *object, object_wr_ctx_t *ctx);
 object_wr_ctx_t *object_write_begin(fbuf_t *f);
 void object_write_end(object_wr_ctx_t *ctx);
-fbuf_t *object_write_file(object_wr_ctx_t *ctx);
 
 object_rd_ctx_t *object_read_begin(fbuf_t *f, const char *fname);
-object_rd_ctx_t *object_read_recover(object_t *object, const char *fname);
 void object_read_end(object_rd_ctx_t *ctx);
-fbuf_t *object_read_file(object_rd_ctx_t *ctx);
-object_t *object_read_recall(object_rd_ctx_t *ctx, index_t index);
 object_t *object_read(object_rd_ctx_t *ctx, int tag);
 
 #endif   // _OBJECT_H

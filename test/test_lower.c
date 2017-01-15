@@ -40,7 +40,7 @@ static void check_bb(int bb, const check_bb_t *expect, int len)
    int eptr = 0, actual = nops;
    for (int i = 0; i < nops && eptr < len; i++) {
       const vcode_op_t vop = vcode_get_op(i);
-      if (vop == VCODE_OP_COMMENT) {
+      if (vop == VCODE_OP_COMMENT || vop == VCODE_OP_DEBUG_INFO) {
          actual--;
          continue;
       }
@@ -282,6 +282,18 @@ static void check_bb(int bb, const check_bb_t *expect, int len)
          }
          break;
 
+      case VCODE_OP_IMAGE_MAP:
+         {
+            image_map_t map;
+            vcode_get_image_map(i, &map);
+            if (!icmp(map.name, e->name)) {
+               vcode_dump();
+               fail("expected op %d in block %d to have image map name %s but "
+                    "has %s", i, bb, e->name, istr(map.name));
+            }
+         }
+         break;
+
       default:
          fail("cannot check op %s", vcode_op_string(e->op));
       }
@@ -481,8 +493,9 @@ START_TEST(test_assign2)
 
    CHECK_BB(0);
 
+   fail_unless(vcode_get_op(6) == VCODE_OP_CONST_ARRAY);
    for (int i = 0; i < 8; i++)
-      fail_unless(vcode_get_arg(5, i) == vcode_get_result((i == 6) ? 3 : 4));
+      fail_unless(vcode_get_arg(6, i) == vcode_get_result((i == 6) ? 4 : 5));
 
    EXPECT_BB(1) = {
       { VCODE_OP_CONST, .value = 2 },
@@ -2057,6 +2070,7 @@ START_TEST(test_issue135)
 
    EXPECT_BB(0) = {
       { VCODE_OP_IMAGE },
+      { VCODE_OP_IMAGE_MAP, .name = "STD.STANDARD.TIME" },
       { VCODE_OP_IMAGE },
       { VCODE_OP_UARRAY_LEN },
       { VCODE_OP_UARRAY_LEN },
@@ -2170,11 +2184,11 @@ START_TEST(test_rectype)
    fail_unless(vtype_kind(0) == VCODE_TYPE_RECORD);
    fail_unless(vtype_kind(1) == VCODE_TYPE_RECORD);
 
-   char *r2_name LOCAL = vtype_record_name(0);
-   fail_unless(strncmp(r2_name, "R2.", 3) == 0);
+   ident_t r2_name = vtype_record_name(0);
+   fail_unless(strncmp(istr(r2_name), "R2@", 3) == 0);
 
-   char *r1_name LOCAL = vtype_record_name(1);
-   fail_unless(strcmp(r1_name, "WORK.RECTYPE.R1") == 0);
+   ident_t r1_name = vtype_record_name(1);
+   fail_unless(icmp(r1_name, "WORK.RECTYPE.R1"));
 }
 END_TEST
 
@@ -2230,11 +2244,11 @@ START_TEST(test_issue167)
    fail_unless(vtype_kind(0) == VCODE_TYPE_RECORD);
    fail_unless(vtype_kind(2) == VCODE_TYPE_RECORD);
 
-   char *p1_name LOCAL = vtype_record_name(0);
-   fail_unless(strcmp(p1_name, "WORK.PKG.P1") == 0);
+   ident_t p1_name = vtype_record_name(0);
+   fail_unless(icmp(p1_name, "WORK.PKG.P1"));
 
-   char *p2_name LOCAL = vtype_record_name(2);
-   fail_unless(strncmp(p2_name, "P2.", 3) == 0);
+   ident_t p2_name = vtype_record_name(2);
+   fail_unless(strncmp(istr(p2_name), "P2@", 3) == 0);
 }
 END_TEST
 

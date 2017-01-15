@@ -93,6 +93,10 @@ static vcode_reg_t lower_array_dir(type_t type, int dim, vcode_reg_t reg);
 typedef vcode_reg_t (*lower_signal_flag_fn_t)(vcode_reg_t, vcode_reg_t);
 typedef vcode_reg_t (*arith_fn_t)(vcode_reg_t, vcode_reg_t);
 
+#define SAVE_DEBUG_INFO \
+   __attribute__((cleanup(emit_debug_info))) \
+   const loc_t _old_loc = *vcode_last_loc()
+
 static bool lower_is_const(tree_t t)
 {
    if (tree_kind(t) == T_AGGREGATE) {
@@ -328,15 +332,18 @@ static vcode_type_t lower_array_type(type_t type)
       return vtype_uarray(array_dimension(type), elem_type, elem_bounds);
 }
 
-static vcode_bookmark_t lower_record_bookmark(type_t type)
+static ident_t lower_record_unique_name(type_t type)
 {
    // If a record type is not qualified with a package name then add a unique
-   // index to its type name to avoid collisions
-   vcode_bookmark_t uniq = { .type = NULL };
+   // suffix to its type name to avoid collisions
    ident_t name = type_ident(type);
-   if (ident_until(name, '.') == name && type_has_index(type))
-      uniq.type = type;
-   return uniq;
+   if (ident_until(name, '.') == name) {
+      char buf[32];
+      checked_sprintf(buf, sizeof(buf), "%"PRIxPTR, (uintptr_t)type);
+      return ident_prefix(name, ident_new(buf), '@');
+   }
+   else
+      return name;
 }
 
 static vcode_type_t lower_type(type_t type)
@@ -369,18 +376,17 @@ static vcode_type_t lower_type(type_t type)
 
    case T_RECORD:
       {
-         ident_t name = type_ident(type);
-         vcode_bookmark_t uniq = lower_record_bookmark(type);
-         vcode_type_t record = vtype_named_record(name, uniq, false);
+         ident_t name = lower_record_unique_name(type);
+         vcode_type_t record = vtype_find_named_record(name);
          if (record == VCODE_INVALID_TYPE) {
-            record = vtype_named_record(name, uniq, true);
+            vtype_named_record(name, NULL, 0);  // Forward-declare the name
 
             const int nfields = type_fields(type);
             vcode_type_t fields[nfields];
             for (int i = 0; i < nfields; i++)
                fields[i] = lower_type(tree_type(type_field(type, i)));
 
-            vtype_set_record_fields(record, fields, nfields);
+            record = vtype_named_record(name, fields, nfields);
          }
 
          return record;
@@ -388,12 +394,9 @@ static vcode_type_t lower_type(type_t type)
 
    case T_PROTECTED:
       {
-         ident_t name = type_ident(type);
-         vcode_bookmark_t uniq = lower_record_bookmark(type);
-         vcode_type_t record = vtype_named_record(name, uniq, false);
+         ident_t name = lower_record_unique_name(type);
+         vcode_type_t record = vtype_find_named_record(name);
          if (record == VCODE_INVALID_TYPE) {
-            record = vtype_named_record(name, uniq, true);
-
             tree_t body = type_body(type);
 
             const int ndecls = tree_decls(body);
@@ -407,7 +410,7 @@ static vcode_type_t lower_type(type_t type)
                fields[nfields++] = lower_type(tree_type(decl));
             }
 
-            vtype_set_record_fields(record, fields, nfields);
+            record = vtype_named_record(name, fields, nfields);
          }
 
          return record;
@@ -504,15 +507,6 @@ static vcode_reg_t lower_wrap(type_t type, vcode_reg_t data)
    return lower_wrap_with_new_bounds(type, data, data);
 }
 
-static vcode_bookmark_t lower_bookmark(tree_t where)
-{
-   vcode_bookmark_t b = {
-      .tree = where
-   };
-
-   return b;
-}
-
 static bounds_kind_t lower_type_bounds_kind(type_t type)
 {
    if (type_is_enum(type))
@@ -562,20 +556,43 @@ static bool lower_scalar_has_static_bounds(type_t type, vcode_reg_t *low_reg,
    return true;
 }
 
+static char *lower_get_hint_string(tree_t where, const char *prefix)
+{
+   switch (tree_kind(where)) {
+   case T_PORT_DECL:
+      return xasprintf("%s|for parameter %s",
+                       prefix ?: "", istr(tree_ident(where)));
+   case T_VAR_DECL:
+      return xasprintf("%s|for variable %s",
+                       prefix ?: "", istr(tree_ident(where)));
+   default:
+      if (prefix != NULL)
+         return xstrdup(prefix);
+      else
+         return NULL;
+   }
+}
+
 static void lower_check_scalar_bounds(vcode_reg_t value, type_t type,
                                       tree_t where, tree_t hint)
 {
-   const vcode_bookmark_t index1 = lower_bookmark(where);
-   const vcode_bookmark_t index2 = hint == NULL ? index1 : lower_bookmark(hint);
+   SAVE_DEBUG_INFO;
+
+   if (tree_kind(where) == T_PORT_DECL)
+      emit_debug_info(tree_loc(hint));
+   else
+      emit_debug_info(tree_loc(where));
 
    const bounds_kind_t kind = lower_type_bounds_kind(type);
+   const char *prefix = kind == BOUNDS_ENUM ? type_pp(type) : NULL;
+   char *hint_str LOCAL = lower_get_hint_string(where, prefix);
 
    vcode_reg_t low_reg, high_reg;
    if (lower_scalar_has_static_bounds(type, &low_reg, &high_reg))
-      emit_bounds(value, lower_bounds(type), kind, index1, index2);
+      emit_bounds(value, lower_bounds(type), kind, hint_str);
    else {
       vcode_reg_t kind_reg = emit_const(vtype_offset(), kind);
-      emit_dynamic_bounds(value, low_reg, high_reg, kind_reg, index1, index2);
+      emit_dynamic_bounds(value, low_reg, high_reg, kind_reg, hint_str);
    }
 }
 
@@ -918,8 +935,9 @@ static ident_t lower_mangle_func(tree_t decl, vcode_unit_t context)
    LOCAL_TEXT_BUF buf = tb_new();
    ident_t name_i = tree_ident(decl);
 
-   const int nest_depth = tree_attr_int(decl, nested_i, 0);
+   bool context_is_thunk = false;
 
+   const int nest_depth = tree_attr_int(decl, nested_i, 0);
    if (nest_depth > 0 || !ident_contains(name_i, ".:")) {
       vcode_state_t state;
       vcode_state_save(&state);
@@ -932,6 +950,8 @@ static ident_t lower_mangle_func(tree_t decl, vcode_unit_t context)
          tb_printf(buf, "%s__", istr(vcode_unit_name()));
       else
          tb_printf(buf, "%s.", istr(vcode_unit_name()));
+
+      context_is_thunk = (vcode_unit_name() == thunk_i);
 
       vcode_state_restore(&state);
    }
@@ -983,7 +1003,8 @@ static ident_t lower_mangle_func(tree_t decl, vcode_unit_t context)
    }
 
    ident_t new = ident_new(tb_get(buf));
-   tree_add_attr_str(decl, mangled_i, new);
+   if (!context_is_thunk)
+      tree_add_attr_str(decl, mangled_i, new);
    return new;
 }
 
@@ -1171,8 +1192,7 @@ static vcode_reg_t lower_builtin(tree_t fcall, ident_t builtin)
    else if (icmp(builtin, "div")) {
       if (!type_eq(r0_type, r1_type))
          r1 = emit_cast(lower_type(r0_type), lower_bounds(r0_type), r1);
-      return lower_narrow(tree_type(fcall),
-                          emit_div(r0, r1, lower_bookmark(fcall)));
+      return lower_narrow(tree_type(fcall), emit_div(r0, r1));
    }
    else if (icmp(builtin, "exp")) {
       if (!type_eq(r0_type, r1_type))
@@ -1305,15 +1325,13 @@ static vcode_reg_t lower_builtin(tree_t fcall, ident_t builtin)
       vcode_type_t vreal  = vtype_real();
       vcode_type_t rtype  = lower_type(tree_type(fcall));
       return emit_cast(rtype, rtype,
-                       emit_div(emit_cast(vreal, vreal, r0),
-                                r1, lower_bookmark(fcall)));
+                       emit_div(emit_cast(vreal, vreal, r0), r1));
    }
    else if (icmp(builtin, "divri")) {
       vcode_type_t vreal  = vtype_real();
       vcode_type_t rtype  = lower_type(tree_type(fcall));
       return emit_cast(rtype, rtype,
-                       emit_div(r0, emit_cast(vreal, vreal, r1),
-                                lower_bookmark(fcall)));
+                       emit_div(r0, emit_cast(vreal, vreal, r1)));
    }
    else
       fatal_at(tree_loc(fcall), "cannot lower builtin %s", istr(builtin));
@@ -1735,6 +1753,13 @@ static void lower_check_array_bounds(type_t type, int dim, vcode_reg_t array,
                                      vcode_reg_t value, tree_t where,
                                      tree_t hint)
 {
+   SAVE_DEBUG_INFO;
+
+   if (tree_kind(where) == T_PORT_DECL)
+      emit_debug_info(tree_loc(hint));
+   else
+      emit_debug_info(tree_loc(where));
+
    vcode_reg_t left_reg  = lower_array_left(type, dim, array);
    vcode_reg_t right_reg = lower_array_right(type, dim, array);
    vcode_reg_t dir_reg   = lower_array_dir(type, dim, array);
@@ -1748,9 +1773,9 @@ static void lower_check_array_bounds(type_t type, int dim, vcode_reg_t array,
                   emit_const(kind_type, BOUNDS_ARRAY_DOWNTO),
                   emit_const(kind_type, BOUNDS_ARRAY_TO));
 
-   const vcode_bookmark_t index = lower_bookmark(where);
-   emit_dynamic_bounds(value, min_reg, max_reg, kind_reg,
-                       index, (hint == NULL ? index : lower_bookmark(hint)));
+   char *hint_str LOCAL = lower_get_hint_string(where, NULL);
+
+   emit_dynamic_bounds(value, min_reg, max_reg, kind_reg, hint_str);
 }
 
 static vcode_reg_t lower_array_ref_offset(tree_t ref, vcode_reg_t array)
@@ -2531,7 +2556,7 @@ static vcode_reg_t lower_new(tree_t expr, expr_ctx_t ctx)
 static vcode_reg_t lower_all(tree_t all, expr_ctx_t ctx)
 {
    vcode_reg_t access_reg = lower_reify_expr(tree_value(all));
-   emit_null_check(access_reg, lower_bookmark(all));
+   emit_null_check(access_reg);
    vcode_reg_t all_reg = emit_all(access_reg);
 
    type_t type = tree_type(all);
@@ -2578,6 +2603,47 @@ static const int lower_get_attr_dimension(tree_t expr)
       return assume_int(tree_value(tree_param(expr, 0))) - 1;
    else
       return 0;
+}
+
+static vcode_reg_t lower_image_map(type_t type)
+{
+   type_t base = type_base_recur(type);
+
+   vcode_reg_t result = VCODE_INVALID_REG;
+   switch (type_kind(base)) {
+   case T_INTEGER:
+   case T_REAL:
+      break;
+
+   case T_ENUM:
+      {
+         const int nlits = type_enum_literals(base);
+         ident_t *map LOCAL = xmalloc(sizeof(ident_t) * nlits);
+         for (int i = 0; i < nlits; i++)
+            map[i] = tree_ident(type_enum_literal(base, i));
+         result = emit_enum_map(type_ident(base), nlits, map);
+      }
+      break;
+
+   case T_PHYSICAL:
+      {
+         const int nunits = type_units(base);
+         ident_t *map LOCAL = xmalloc(sizeof(ident_t) * nunits);
+         int64_t *values LOCAL = xmalloc(sizeof(int64_t) * nunits);
+         for (int i = 0; i < nunits; i++) {
+            tree_t unit = type_unit(base, i);
+            map[i] = tree_ident(unit);
+            values[i] = assume_int(tree_value(unit));
+         }
+         result = emit_physical_map(type_ident(base), nunits, map, values);
+      }
+      break;
+
+   default:
+      fatal_trace("cannot generate image map for %s", type_pp(type));
+   }
+
+   return result;
 }
 
 static vcode_reg_t lower_attr_ref(tree_t expr, expr_ctx_t ctx)
@@ -2695,9 +2761,9 @@ static vcode_reg_t lower_attr_ref(tree_t expr, expr_ctx_t ctx)
    case ATTR_IMAGE:
       {
          tree_t value = tree_value(tree_param(expr, 0));
+         vcode_reg_t map = lower_image_map(tree_type(value));
          tmp_alloc_used = true;
-         return emit_image(lower_param(value, NULL, PORT_IN),
-                           lower_bookmark(name));
+         return emit_image(lower_param(value, NULL, PORT_IN), map);
       }
 
    case ATTR_VALUE:
@@ -2705,9 +2771,9 @@ static vcode_reg_t lower_attr_ref(tree_t expr, expr_ctx_t ctx)
          type_t name_type = tree_type(name);
          tree_t value = tree_value(tree_param(expr, 0));
          vcode_reg_t arg = lower_param(value, NULL, PORT_IN);
-         vcode_reg_t reg = emit_value(lower_array_data(arg),
-                                      lower_array_len(tree_type(value), 0, arg),
-                                      lower_bookmark(expr));
+         vcode_reg_t map = lower_image_map(name_type);
+         vcode_reg_t len = lower_array_len(tree_type(value), 0, arg);
+         vcode_reg_t reg = emit_value(lower_array_data(arg), len, map);
          lower_check_scalar_bounds(reg, name_type, expr, NULL);
          return emit_cast(lower_type(name_type), lower_bounds(name_type), reg);
       }
@@ -2861,9 +2927,9 @@ static void lower_assert(tree_t stmt)
    }
 
    if (is_report)
-      emit_report(message, length, severity, lower_bookmark(stmt));
+      emit_report(message, length, severity);
    else
-      emit_assert(value, message, length, severity, lower_bookmark(stmt));
+      emit_assert(value, message, length, severity);
 
    if (saved_heap != VCODE_INVALID_REG)
       lower_cleanup_temp_objects(saved_heap);
@@ -3073,7 +3139,7 @@ static void lower_check_array_sizes(tree_t t, type_t ltype, type_t rtype,
    vcode_reg_t llen_reg = lower_array_len(ltype, 0, lval);
    vcode_reg_t rlen_reg = lower_array_len(rtype, 0, rval);
 
-   emit_array_size(llen_reg, rlen_reg, lower_bookmark(t));
+   emit_array_size(llen_reg, rlen_reg);
 }
 
 static void lower_find_matching_refs(tree_t ref, void *context)
@@ -3898,6 +3964,8 @@ static void lower_stmt(tree_t stmt, loop_stack_t *loops)
    if (cover_tag != -1)
       emit_cover_stmt(cover_tag);
 
+   emit_debug_info(tree_loc(stmt));
+
    switch (tree_kind(stmt)) {
    case T_ASSERT:
       lower_assert(stmt);
@@ -3944,6 +4012,9 @@ static void lower_stmt(tree_t stmt, loop_stack_t *loops)
 
 static void lower_check_indexes(type_t type, vcode_reg_t array, tree_t hint)
 {
+   SAVE_DEBUG_INFO;
+   emit_debug_info(tree_loc(hint));
+
    const int ndims = array_dimension(type);
    for (int i = 0; i < ndims; i++) {
       type_t index = index_type_of(type, i);
@@ -3954,8 +4025,7 @@ static void lower_check_indexes(type_t type, vcode_reg_t array, tree_t hint)
       vcode_reg_t right_reg = lower_array_right(type, i, array);
 
       if (type_is_enum(index))
-         emit_index_check(left_reg, right_reg, vbounds,
-                          BOUNDS_INDEX_TO, lower_bookmark(hint));
+         emit_index_check(left_reg, right_reg, vbounds, BOUNDS_INDEX_TO);
       else {
          range_t rindex = type_dim(index, 0);
          bounds_kind_t bkind  = rindex.kind == RANGE_TO
@@ -3974,8 +4044,7 @@ static void lower_check_indexes(type_t type, vcode_reg_t array, tree_t hint)
          }
 
          if (lower_is_const(rindex.left) && lower_is_const(rindex.right)) {
-            emit_index_check(rlow_reg, rhigh_reg, vbounds,
-                             bkind, lower_bookmark(hint));
+            emit_index_check(rlow_reg, rhigh_reg, vbounds, bkind);
          }
          else {
             vcode_reg_t bleft  = lower_reify_expr(rindex.left);
@@ -3984,8 +4053,7 @@ static void lower_check_indexes(type_t type, vcode_reg_t array, tree_t hint)
             vcode_reg_t bmin = bkind == BOUNDS_INDEX_TO ? bleft : bright;
             vcode_reg_t bmax = bkind == BOUNDS_INDEX_TO ? bright : bleft;
 
-            emit_dynamic_index_check(rlow_reg, rhigh_reg, bmin, bmax,
-                                     bkind, lower_bookmark(hint));
+            emit_dynamic_index_check(rlow_reg, rhigh_reg, bmin, bmax, bkind);
          }
       }
    }
@@ -4046,6 +4114,8 @@ static void lower_var_decl(tree_t decl)
 
    if (!tree_has_value(decl))
       return;
+
+   emit_debug_info(tree_loc(decl));
 
    vcode_reg_t dest_reg  = VCODE_INVALID_REG;
    vcode_reg_t count_reg = VCODE_INVALID_REG;
@@ -4167,7 +4237,7 @@ static void lower_signal_decl(tree_t decl)
          rtype = lower_type(rbase);
       }
 
-      emit_set_initial(sig, init_reg, lower_bookmark(decl), rfunc, rtype);
+      emit_set_initial(sig, init_reg, rfunc, rtype);
    }
 
    // Identify signals which potentially need 'LAST_VALUE
@@ -4224,8 +4294,8 @@ static void lower_decl(tree_t decl)
       lower_file_decl(decl);
       break;
 
-   case T_TYPE_DECL:
    case T_HIER:
+   case T_TYPE_DECL:
    case T_ALIAS:
    case T_FUNC_DECL:
    case T_PROC_DECL:
@@ -4427,6 +4497,8 @@ static void lower_proc_body(tree_t body, vcode_unit_t context)
    else
       vu = emit_procedure(name, context);
 
+   emit_debug_info(tree_loc(body));
+
    const bool has_subprograms = lower_has_subprograms(body);
    lower_subprogram_ports(body, has_subprograms);
 
@@ -4457,6 +4529,7 @@ static void lower_func_body(tree_t body, vcode_unit_t context)
 
    tree_add_attr_str(body, mangled_i, name);
    vcode_unit_t vu = emit_function(name, context, vtype);
+   emit_debug_info(tree_loc(body));
 
    const bool has_subprograms = lower_has_subprograms(body);
    lower_subprogram_ports(body, has_subprograms);
@@ -4666,6 +4739,7 @@ static void lower_driver_fn(tree_t t, void *_ctx)
 static void lower_process(tree_t proc, vcode_unit_t context)
 {
    vcode_unit_t vu = emit_process(tree_ident(proc), context);
+   emit_debug_info(tree_loc(proc));
 
    lower_decls(proc, vu);
    tree_visit(proc, lower_driver_fn, proc);
@@ -4691,6 +4765,7 @@ static void lower_process(tree_t proc, vcode_unit_t context)
 static vcode_unit_t lower_elab(tree_t unit)
 {
    vcode_unit_t context = emit_context(tree_ident(unit));
+   emit_debug_info(tree_loc(unit));
 
    lower_decls(unit, context);
 
@@ -4798,7 +4873,7 @@ vcode_unit_t lower_thunk(tree_t fcall)
 {
    lower_set_verbose();
 
-   vcode_unit_t context = emit_context(ident_new("thunk"));
+   vcode_unit_t context = emit_context(thunk_i);
 
    vcode_select_unit(context);
    mode = LOWER_THUNK;
