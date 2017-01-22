@@ -108,7 +108,7 @@ AC_DEFUN([AX_LLVM_C],
 
                 LLVM_OBJ_EXT="o"
                 case $host_os in
-                    *cygwin*)
+                    *cygwin*|msys*|mingw32*)
                         if test "$llvm_ver_num" -ge "35"; then
                             LLVM_OBJ_EXT="obj"
                         fi
